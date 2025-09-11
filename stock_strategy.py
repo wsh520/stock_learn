@@ -19,6 +19,52 @@ def safe_float(val):
     except Exception:
         return np.nan
 
+# 新增: 百分比与金额解析工具
+def parse_percent(val):
+    """将可能带有 % / 逗号 / 空白 的数值解析为 float（以百分数的数值，如 12.3 表示12.3%）"""
+    if val is None or (isinstance(val, float) and np.isnan(val)):
+        return np.nan
+    try:
+        s = str(val).strip().replace(',', '')
+        if s in ('', '-', '—', 'None', 'nan', 'NaN'):
+            return np.nan
+        if s.endswith('%'):
+            s = s[:-1]
+        return float(s)
+    except Exception:
+        return safe_float(val)
+
+def normalize_money_to_wan(val):
+    """将金额统一转为“万”为单位。支持字符串带单位（亿/万/元），或纯数值（默认按万，若数量级似乎是元则转换）。"""
+    if val is None or (isinstance(val, float) and np.isnan(val)):
+        return np.nan
+    try:
+        s = str(val).strip().replace(',', '')
+        if s in ('', '-', '—', 'None', 'nan', 'NaN'):
+            return np.nan
+        # 显式单位优先
+        if s.endswith('亿'):
+            num = float(s[:-1])
+            return num * 10000.0  # 亿 -> 万
+        if s.endswith('万'):
+            num = float(s[:-1])
+            return num
+        if s.endswith('元'):
+            num = float(s[:-1])
+            return num / 10000.0  # 元 -> 万
+        # 无单位：尝试为纯数
+        num = float(s)
+        # 经验阈值：若数量级很大，可能是元 -> 转万
+        if abs(num) >= 1e7:
+            return num / 10000.0
+        return num  # 默认已是“万”
+    except Exception:
+        # 回退到数值判断
+        f = safe_float(val)
+        if not np.isnan(f) and abs(f) >= 1e7:
+            return f / 10000.0
+        return f
+
 def drop_duplicate_columns(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
         return df
@@ -64,7 +110,8 @@ def get_fundamental_indicator(symbol: str):
     def pick_val(cands):
         for c in cands:
             if c in df.columns and not pd.isna(row[c]):
-                return safe_float(row[c])
+                # 使用百分比解析，剔除“%”等
+                return parse_percent(row[c])
         return np.nan
     roe = pick_val(['净资产收益率加权(%)','净资产收益率(%)','ROE加权(%)','ROE(%)','净资产收益率-加权(%)'])
     net_margin = pick_val(['销售净利率(%)','净利率(%)','销售净利率','净利率'])
@@ -876,9 +923,7 @@ def run_stock_screener():
         # 主力净流入标准化为万
         try:
             if col_fund_flow and col_fund_flow in row.index:
-                raw_flow = safe_float(row[col_fund_flow])
-                if not np.isnan(raw_flow):
-                    main_flow_wan = raw_flow / 10000.0 if abs(raw_flow) > 1e6 else raw_flow
+                main_flow_wan = normalize_money_to_wan(row[col_fund_flow])
         except Exception:
             pass
         # 预筛指标标记（用于展示）
@@ -936,6 +981,24 @@ def run_stock_screener():
         print("\n最终筛选结果：没有记录。")
         return
     result_df = pd.DataFrame(final_selection)
+    # 删除“基本面合格”与旧的整体占比列（若存在）
+    for col in ['基本面合格', '基本面合格✓占比(%)']:
+        if col in result_df.columns:
+            result_df.drop(columns=[col], inplace=True)
+    # 新增：统计“涨幅区间”到“放量突破”之间各指标中✓的占比（逐行，✓/(✓+✗)*100）
+    cols_all = list(result_df.columns)
+    if '涨幅区间' in cols_all and '放量突破' in cols_all:
+        start_idx = cols_all.index('涨幅区间')
+        end_idx = cols_all.index('放量突破')
+        if start_idx <= end_idx:
+            subset = result_df.iloc[:, start_idx:end_idx+1]
+            applicable = subset.applymap(lambda x: x in ('✓','✗'))
+            passed = subset.applymap(lambda x: x == '✓')
+            denom = applicable.sum(axis=1).replace(0, np.nan)
+            core_ratio = (passed.sum(axis=1) / denom * 100.0).round(2)
+            # 插入在“放量突破”之后
+            insert_pos = end_idx + 1
+            result_df.insert(insert_pos, '核心指标✓占比(%)', core_ratio)
     # 排序：核心优先 相对强度↓ 主力净流入↓ ATR%↑; 次级再参考 涨跌幅↓ 换手率↓ 流通市值↑
     core_keys = []
     if rel_col_name in result_df.columns: core_keys.append(rel_col_name)
@@ -955,6 +1018,12 @@ def run_stock_screener():
                 result_df.rename(columns={'主力净��入(万)':'主力净流入(万)'}, inplace=True)
             result_df['主力净流入(万)'] = result_df['主力净流入(万)'].fillna(-1e12)
         result_df.sort_values(by=sort_keys, ascending=ascending_flags, inplace=True)
+    # 统一对百分比列四舍五入保留两位小数（列名包含“%”）
+    percent_cols = [c for c in result_df.columns if '%' in str(c)]
+    if percent_cols:
+        for c in percent_cols:
+            result_df[c] = pd.to_numeric(result_df[c], errors='coerce')
+        result_df[percent_cols] = result_df[percent_cols].round(2)
     pd.options.display.float_format = '{:.2f}'.format
     print("\n\n========================= 精选列表（不筛除，含指标匹配与匹配率） =========================")
     print(result_df)
