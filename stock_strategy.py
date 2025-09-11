@@ -408,9 +408,12 @@ def get_hs300_constituents(force_refresh: bool = False) -> set:
             weight_func = getattr(ak, 'index_zh_index_weight_csindex', None)
             if callable(weight_func):
                 wdf = weight_func(symbol="000300", start_date=start, end_date=end)
-                codes = normalize_codes(wdf, ['成分券代码Constituent Code', '代码'])
-                if codes:
-                    collected |= codes
+                if isinstance(wdf, pd.DataFrame) and not wdf.empty:
+                    codes = normalize_codes(wdf, ['成分券代码Constituent Code', '代码'])
+                    if codes:
+                        collected |= codes
+                else:
+                    errors.append("index_zh_index_weight_csindex 返回异常类型或空数据")
             else:
                 errors.append("index_zh_index_weight_csindex 函数不可用")
         except Exception as e:
@@ -479,8 +482,11 @@ def get_zz500_constituents(force_refresh: bool = False) -> set:
             weight_func = getattr(ak, 'index_zh_index_weight_csindex', None)
             if callable(weight_func):
                 wdf = weight_func(symbol="000905", start_date=start, end_date=end)
-                codes = normalize_codes(wdf, ['成分券代码Constituent Code', '代码'])
-                if codes: collected |= codes
+                if isinstance(wdf, pd.DataFrame) and not wdf.empty:
+                    codes = normalize_codes(wdf, ['成分券代码Constituent Code', '代码'])
+                    if codes: collected |= codes
+                else:
+                    errors.append("index_zh_index_weight_csindex 返回异常类型或空数据")
             else:
                 errors.append("index_zh_index_weight_csindex 函数不可用")
         except Exception as e:
@@ -666,6 +672,14 @@ def run_stock_screener():
         return
     print(f"上证主板候选数: {len(stock_spot_df)}")
     strong_stocks_set, stock_to_sector_map = get_strong_sectors()
+    # 行业映射容错：接口可能返回 None
+    if not isinstance(stock_to_sector_map, dict):
+        stock_to_sector_map = {}
+    # 强势股集合容错：确保为集合
+    if isinstance(strong_stocks_set, (list, tuple, set)):
+        strong_stocks_set = set(strong_stocks_set)
+    else:
+        strong_stocks_set = set()
     f = CONFIG['filter']
     # 在动态调整前复制一份可调参数
     adj_filter = f.copy()
@@ -733,7 +747,7 @@ def run_stock_screener():
         print(f"保存精选阶段快照失败: {e}")
     # --- 精选逻辑继续 ---
     final_selection = []
-    reason_stats = {}  # 统计各类过滤原因
+    # 移除过滤原因统计与剔除逻辑，改为对每只股票标注指标通过情况
     index_hist_main = get_index_hist_data(CONFIG['market_timing']['index_code'], days=120)
     rs_days = CONFIG['technique']['rs_days']
     atr_soft = CONFIG['technique']['max_atr_pct'] * CONFIG['technique'].get('atr_soft_margin', 1.0)
@@ -742,154 +756,184 @@ def run_stock_screener():
     em_conf = CONFIG['enhanced_metrics']
     for _, row in pre_selected_df.iterrows():
         stock_code = row['代码']; stock_name = row['名称']
-        print(f"\n正在分析 -> {stock_name} ({stock_code})")
+        print(f"\n分析 -> {stock_name} ({stock_code})")
+        # 默认值
+        latest_price = safe_float(row[col_price])
+        atr_pct = np.nan
+        hard_atr_ok = None
+        rs_ok = None
+        rs_value = np.nan
+        amount = safe_float(row[col_amount]); vol = safe_float(row[col_volume])
+        vwap = np.nan; vwap_ok = None
+        ma_bull_ok = None
+        stair_ok = None
+        breakout_ok = None
+        main_flow_wan = np.nan
+        limit_up_col = f"近{em_conf['limit_up_lookback']}日涨停数"; limit_up_count = np.nan
+        vol_contraction = np.nan
+        roe_v = np.nan; nm_v = np.nan; fundamental_ok = None
         try:
-            hist_df = get_hist_data(stock_code, 200)  # 取更多以利于 ATR / 波动收缩
-            if hist_df.empty or len(hist_df) < int(max(CONFIG['technique']['ma_list'])) + 5:
-                reason_stats['历史数据不足'] = reason_stats.get('历史数据不足', 0) + 1
-                print("  - [过滤] 历史数据不足"); continue
-            for ma in CONFIG['technique']['ma_list']:
-                hist_df[f'MA{ma}'] = hist_df['收盘'].rolling(window=ma).mean()
-            hist_df['ATR'] = calculate_atr(hist_df, CONFIG['technique']['atr_days'], wilder=use_wilder)
-            # 涨跌幅% 计算（若不存在）
-            if '涨跌幅' in hist_df.columns:
-                if '涨跌幅%' not in hist_df.columns:
+            # 历史数据与技术指标
+            hist_df = get_hist_data(stock_code, 200)
+            if hist_df is not None and not hist_df.empty:
+                for ma in CONFIG['technique']['ma_list']:
+                    hist_df[f'MA{ma}'] = hist_df['收盘'].rolling(window=ma).mean()
+                hist_df['ATR'] = calculate_atr(hist_df, CONFIG['technique']['atr_days'], wilder=use_wilder)
+                # 涨跌幅%
+                if '涨跌幅' in hist_df.columns and '涨跌幅%' not in hist_df.columns:
                     try:
                         hist_df['涨跌幅%'] = pd.to_numeric(hist_df['涨跌幅'].astype(str).str.replace('%',''), errors='coerce')
                     except Exception:
                         hist_df['涨跌幅%'] = hist_df['收盘'].pct_change()*100
-            else:
-                hist_df['涨跌幅%'] = hist_df['收盘'].pct_change()*100
-            latest = hist_df.iloc[-1]
-            close_val = float(latest['收盘']) if not pd.isna(latest['收盘']) else np.nan
-            atr_val = float(latest.get('ATR', np.nan)) if not pd.isna(latest.get('ATR', np.nan)) else np.nan
-            atr_pct = (atr_val / close_val * 100) if close_val and not np.isnan(atr_val) else np.nan
-            if np.isnan(atr_pct):
-                reason_stats['ATR无效'] = reason_stats.get('ATR无效', 0) + 1
-                print("  - [过滤] ATR无效"); continue
-            if atr_pct > CONFIG['technique']['max_atr_pct']:
-                if atr_pct <= atr_soft:
-                    print(f"  * [宽松通过] ATR边缘 {atr_pct:.2f}% > {CONFIG['technique']['max_atr_pct']}%")
-                else:
-                    reason_stats['ATR过高'] = reason_stats.get('ATR过高', 0) + 1
-                    print(f"  - [过滤] ATR过高 {atr_pct:.2f}% > {CONFIG['technique']['max_atr_pct']}%")
-                    continue
-            if len(hist_df['收盘']) < rs_days:
-                reason_stats['RS数据不足'] = reason_stats.get('RS数据不足', 0) + 1
-                print("  - [过滤] 历史不足计算相对强度"); continue
-            if index_hist_main.empty or len(index_hist_main) < rs_days:
-                bench_return = 0.0
-            else:
-                bench_return = float((index_hist_main['收盘'].iloc[-1] / index_hist_main['收盘'].iloc[-rs_days]) - 1)
-            stock_return = float((close_val / hist_df['收盘'].iloc[-rs_days]) - 1)
-            if stock_return < bench_return:
-                reason_stats['相对强度弱'] = reason_stats.get('相对强度弱', 0) + 1
-                print(f"  - [过滤] 相对强度弱 (个股:{stock_return:.2%}, 指数:{bench_return:.2%})"); continue
-            # VWAP 单位自适应
-            amount = safe_float(row[col_amount])
-            vol = safe_float(row[col_volume])
-            latest_price = safe_float(row[col_price])
-            if vol is not None and not np.isnan(vol) and vol > 0:
-                vwap_guess = amount / vol if vol != 0 else np.nan
-                if latest_price and not np.isnan(latest_price) and latest_price * 0.7 <= vwap_guess <= latest_price * 1.3:
-                    vwap = vwap_guess
-                else:
-                    vwap = amount / (vol * 100) if vol and vol * 100 != 0 else np.nan
-            else:
-                vwap = np.nan
-            if latest_price and not np.isnan(latest_price) and vwap and not np.isnan(vwap):
-                if latest_price < vwap * 0.98:  # 允许 2% 噪声
-                    reason_stats['低于VWAP'] = reason_stats.get('低于VWAP', 0) + 1
-                    print(f"  - [过滤] 低于VWAP {vwap:.2f}"); continue
-            ma_values = [float(latest[f'MA{d}']) for d in CONFIG['technique']['ma_list']]
-            if any(np.isnan(ma_values)):
-                reason_stats['均线NaN'] = reason_stats.get('均线NaN', 0) + 1
-                print("  - [过滤] 均线NaN"); continue
-            if not (ma_values[0] > ma_values[1] > ma_values[2] > ma_values[3] and close_val > ma_values[0]):
-                reason_stats['均线非多头'] = reason_stats.get('均线非多头', 0) + 1
-                print("  - [过滤] 均线非多头"); continue
-            if not is_stair_step_volume(hist_df, CONFIG['technique']['volume_step_days']):
-                reason_stats['非台阶放量'] = reason_stats.get('非台阶放量', 0) + 1
-                print("  - [过滤] 非台阶放量"); continue
-            avg_vol = hist_df['成交量'].iloc[-CONFIG['technique']['volume_breakout_days']:-1].mean()
-            if latest['成交量'] < avg_vol * CONFIG['technique']['volume_breakout_ratio']:
-                reason_stats['未放量突破'] = reason_stats.get('未放量突破', 0) + 1
-                print("  - [过滤] 未放量突破"); continue
-            # 资金流（主力净流入）标准化为 万
-            main_flow_wan = np.nan
-            if col_fund_flow and col_fund_flow in row.index:
-                raw_flow = safe_float(row[col_fund_flow])
-                if not np.isnan(raw_flow):
-                    if abs(raw_flow) > 1e6:  # 可能为元
-                        main_flow_wan = raw_flow / 10000.0
+                elif '涨跌幅%' not in hist_df.columns:
+                    hist_df['涨跌幅%'] = hist_df['收盘'].pct_change()*100
+                latest = hist_df.iloc[-1]
+                close_val = safe_float(latest['收盘'])
+                atr_val = safe_float(latest.get('ATR', np.nan))
+                if close_val and not np.isnan(close_val) and atr_val and not np.isnan(atr_val):
+                    atr_pct = atr_val / close_val * 100.0
+                    hard_atr_ok = bool(atr_pct <= CONFIG['technique']['max_atr_pct'])
+                    # 宽松提示仅打印，不影响标记
+                    if not hard_atr_ok and atr_pct <= atr_soft:
+                        print(f"  * [宽松提醒] ATR边缘 {atr_pct:.2f}% > {CONFIG['technique']['max_atr_pct']}%")
+                # 相对强度
+                if len(hist_df['收盘']) >= rs_days:
+                    if index_hist_main is None or index_hist_main.empty or len(index_hist_main) < rs_days:
+                        bench_return = 0.0
                     else:
-                        main_flow_wan = raw_flow
-            # 涨停统计列名
-            limit_up_col = f"近{em_conf['limit_up_lookback']}日涨停数"
-            limit_up_count = np.nan
-            look = em_conf['limit_up_lookback']
-            if len(hist_df) >= look:
-                recent_pct = hist_df['涨跌幅%'].iloc[-look:]
-                limit_up_count = int((recent_pct >= em_conf['limit_up_threshold']).sum())
-            else:
-                recent_pct = hist_df['涨跌幅%']
-                limit_up_count = int((recent_pct >= em_conf['limit_up_threshold']).sum())
-            # 波动收缩度 (近期 ATR 均值 / 前期 ATR 均值)
-            vol_contraction = np.nan
-            if em_conf.get('enable_vol_contraction'):
-                r_win = em_conf['vol_contraction_recent']
-                p_win = em_conf['vol_contraction_prev']
-                if len(hist_df) >= r_win + p_win + 5 and hist_df['ATR'].notna().sum() > (r_win + p_win//2):
-                    recent_atr_mean = hist_df['ATR'].iloc[-r_win:].mean()
-                    prev_atr_mean = hist_df['ATR'].iloc[-(r_win + p_win):-r_win].mean()
-                    if prev_atr_mean and not np.isnan(prev_atr_mean):
-                        vol_contraction = recent_atr_mean / prev_atr_mean if prev_atr_mean != 0 else np.nan
-            # 基本面过滤
+                        bench_return = float((index_hist_main['收盘'].iloc[-1] / index_hist_main['收盘'].iloc[-rs_days]) - 1)
+                    stock_return = float((close_val / hist_df['收盘'].iloc[-rs_days]) - 1) if close_val and not np.isnan(close_val) else np.nan
+                    if not np.isnan(stock_return):
+                        rs_ok = stock_return >= bench_return
+                        rs_value = (stock_return - bench_return) * 100.0
+                # VWAP
+                if vol is not None and not np.isnan(vol) and vol > 0 and amount is not None and not np.isnan(amount):
+                    vwap_guess = amount / vol if vol != 0 else np.nan
+                    if latest_price and not np.isnan(latest_price) and latest_price * 0.7 <= vwap_guess <= latest_price * 1.3:
+                        vwap = vwap_guess
+                    else:
+                        vwap = amount / (vol * 100) if vol and vol * 100 != 0 else np.nan
+                    if vwap and not np.isnan(vwap) and latest_price and not np.isnan(latest_price):
+                        vwap_ok = latest_price >= vwap * 0.98
+                # 均线多头
+                try:
+                    ma_values = [safe_float(latest.get(f'MA{d}', np.nan)) for d in CONFIG['technique']['ma_list']]
+                    if all(v is not None and not np.isnan(v) for v in ma_values) and not np.isnan(safe_float(latest.get('收盘', np.nan))):
+                        ma_bull_ok = (ma_values[0] > ma_values[1] > ma_values[2] > ma_values[3] and safe_float(latest.get('收盘')) > ma_values[0])
+                except Exception:
+                    pass
+                # 台阶放量
+                try:
+                    stair_ok = is_stair_step_volume(hist_df, CONFIG['technique']['volume_step_days']) if len(hist_df) >= CONFIG['technique']['volume_step_days'] + 1 else None
+                except Exception:
+                    stair_ok = None
+                # 放量突破
+                try:
+                    if len(hist_df) >= CONFIG['technique']['volume_breakout_days'] + 1:
+                        avg_vol = hist_df['成交量'].iloc[-CONFIG['technique']['volume_breakout_days']:-1].mean()
+                        breakout_ok = bool(hist_df['成交量'].iloc[-1] >= avg_vol * CONFIG['technique']['volume_breakout_ratio'])
+                    else:
+                        breakout_ok = None
+                except Exception:
+                    breakout_ok = None
+                # 涨停计数
+                try:
+                    look = em_conf['limit_up_lookback']
+                    if len(hist_df) >= look:
+                        recent_pct = hist_df['涨跌幅%'].iloc[-look:]
+                    else:
+                        recent_pct = hist_df['涨跌幅%']
+                    limit_up_count = int((recent_pct >= em_conf['limit_up_threshold']).sum())
+                except Exception:
+                    limit_up_count = np.nan
+                # 波动收缩度
+                try:
+                    if em_conf.get('enable_vol_contraction') and hist_df['ATR'].notna().sum() > 0:
+                        r_win = em_conf['vol_contraction_recent']
+                        p_win = em_conf['vol_contraction_prev']
+                        if len(hist_df) >= r_win + p_win + 5 and hist_df['ATR'].notna().sum() > (r_win + p_win//2):
+                            recent_atr_mean = hist_df['ATR'].iloc[-r_win:].mean()
+                            prev_atr_mean = hist_df['ATR'].iloc[-(r_win + p_win):-r_win].mean()
+                            if prev_atr_mean and not np.isnan(prev_atr_mean) and prev_atr_mean != 0:
+                                vol_contraction = recent_atr_mean / prev_atr_mean
+                except Exception:
+                    vol_contraction = np.nan
+            # 基本面
             fund = get_fundamental_indicator(stock_code)
             roe_need = CONFIG['fundamental']['min_roe']
             nm_need = CONFIG['fundamental']['min_net_margin']
-            roe_v = fund['roe']; nm_v = fund['net_margin']
+            roe_v = fund.get('roe', np.nan)
+            nm_v = fund.get('net_margin', np.nan)
             if CONFIG['fundamental']['enabled']:
-                if (pd.isna(roe_v) or roe_v < roe_need) or (pd.isna(nm_v) or nm_v < nm_need):
-                    reason_stats['基本面不达标'] = reason_stats.get('基本面不达标', 0) + 1
-                    print(f"  - [过滤] 基本面弱 ROE:{roe_v if not np.isnan(roe_v) else 'NaN'} 净利率:{nm_v if not np.isnan(nm_v) else 'NaN'}")
-                    continue
-            final_selection.append({
-                '代码': stock_code,
-                '名称': stock_name,
-                '最新价': latest_price,
-                '涨跌幅(%)': row[col_change],
-                '换手率(%)': row[col_turnover],
-                '量比': row[col_volume_ratio],
-                rel_col_name: (stock_return - bench_return) * 100,
-                'ATR%': atr_pct,
-                '流通市值(亿)': row[col_mv] / 10 ** 8,
-                '主力净流入(万)': main_flow_wan,
-                limit_up_col: limit_up_count,
-                '波动收缩度': vol_contraction,
-                'ROE(%)': roe_v,
-                '净利率(%)': nm_v,
-                '所属行业': stock_to_sector_map.get(stock_code, '未知')
-            })
-            print(f"  +++ [入选] {stock_name} ({stock_code})")
+                if (pd.isna(roe_v) or pd.isna(nm_v)):
+                    fundamental_ok = None
+                else:
+                    fundamental_ok = bool(roe_v >= roe_need and nm_v >= nm_need)
+            else:
+                fundamental_ok = None
         except Exception as e:
-            reason_stats['异常'] = reason_stats.get('异常', 0) + 1
-            print(f"  - [错误] 分析 {stock_name} ({stock_code}) 时出错: {e}")
-    # 汇总与导出过滤原因
-    if reason_stats:
-        print("\n过滤原因统计:")
-        for k,v in sorted(reason_stats.items(), key=lambda x: -x[1]):
-            print(f"  {k}: {v}")
+            print(f"  - [提示] 计算指标时出错: {e}")
+        # 主力净流入标准化为万
         try:
-            reason_df = pd.DataFrame([{'原因':k,'数量':v} for k,v in reason_stats.items()])
-            reason_df.sort_values('数量', ascending=False, inplace=True)
-            reason_filename = f"filter_reasons_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-            reason_df.to_csv(reason_filename, index=False, encoding='utf-8-sig')
-            print(f"过滤原因统计已保存: {reason_filename}")
-        except Exception as e:
-            print(f"过滤原因统计导出失败: {e}")
+            if col_fund_flow and col_fund_flow in row.index:
+                raw_flow = safe_float(row[col_fund_flow])
+                if not np.isnan(raw_flow):
+                    main_flow_wan = raw_flow / 10000.0 if abs(raw_flow) > 1e6 else raw_flow
+        except Exception:
+            pass
+        # 预筛指标标记（用于展示）
+        prelim_flags = {
+            '涨幅区间': (row[col_change] >= adj_filter['change_rate_min']) and (row[col_change] <= adj_filter['change_rate_max']),
+            '量比≥下限': (row[col_volume_ratio] >= adj_filter['volume_ratio_min']),
+            '换手率区间': (row[col_turnover] >= adj_filter['turnover_rate_min']) and (row[col_turnover] <= adj_filter['turnover_rate_max']),
+            '流通市值区间': (row[col_mv] >= adj_filter['market_cap_min']) and (row[col_mv] <= adj_filter['market_cap_max']),
+            '非ST/非N': (not str(row['名称']).startswith('N')) and ('ST' not in str(row['名称'])),
+        }
+        if intraday_strength:
+            prelim_flags['日内强度≥阈值'] = (row['日内强度'] >= adj_filter.get('intraday_strength_min', 0))
+        if strong_stocks_set:
+            prelim_flags['强势行业'] = (stock_code in strong_stocks_set)
+        # 精选指标标记
+        final_flags = {
+            'ATR≤硬阈值': hard_atr_ok,
+            'RS优于指数': rs_ok,
+            '价≥VWAP(98%)': vwap_ok,
+            '均线多头': ma_bull_ok,
+            '台阶放量': stair_ok,
+            '放量突破': breakout_ok,
+            '基本面合格': fundamental_ok,
+        }
+        # 计算匹配率
+        all_flags = {**prelim_flags, **final_flags}
+        applicable_vals = [v for v in all_flags.values() if isinstance(v, bool)]
+        passed_cnt = int(sum(1 for v in applicable_vals if v))
+        total_cnt = int(len(applicable_vals))
+        match_rate = round((passed_cnt / total_cnt * 100.0), 2) if total_cnt > 0 else np.nan
+        pretty_flags = {k: ('✓' if v else '✗') if isinstance(v, bool) else '-' for k, v in all_flags.items()}
+        # 记录
+        record = {
+            '代码': stock_code,
+            '名称': stock_name,
+            '最新价': latest_price,
+            '涨跌幅(%)': row[col_change],
+            '换手率(%)': row[col_turnover],
+            '量比': row[col_volume_ratio],
+            rel_col_name: rs_value,
+            'ATR%': atr_pct,
+            '流通市值(亿)': row[col_mv] / 10 ** 8,
+            '主力净流入(万)': main_flow_wan,
+            limit_up_col: limit_up_count,
+            '波动收缩度': vol_contraction,
+            'ROE(%)': roe_v,
+            '净利率(%)': nm_v,
+            '所属行业': stock_to_sector_map.get(stock_code, '未知'),
+            '匹配率(%)': match_rate,
+        }
+        record.update(pretty_flags)
+        final_selection.append(record)
+    # 不再打印或导出过滤原因统计
     if not final_selection:
-        print("\n最终筛选结果：没有符合所有条件的股票。")
+        print("\n最终筛选结果：没有记录。")
         return
     result_df = pd.DataFrame(final_selection)
     # 排序：核心优先 相对强度↓ 主力净流入↓ ATR%↑; 次级再参考 涨跌幅↓ 换手率↓ 流通市值↑
@@ -897,24 +941,22 @@ def run_stock_screener():
     if rel_col_name in result_df.columns: core_keys.append(rel_col_name)
     if '主力净流入(万)' in result_df.columns: core_keys.append('主力净流入(万)')
     if 'ATR%' in result_df.columns: core_keys.append('ATR%')
-    secondary = [k for k in ['涨跌幅(%)','换手率(%)','流通市值(亿)','ROE(%)','净利率(%)'] if k in result_df.columns]
+    secondary = [k for k in ['匹配率(%)','涨跌幅(%)','换手率(%)','流通市值(亿)','ROE(%)','净利率(%)'] if k in result_df.columns]
     sort_keys = core_keys + secondary
     if sort_keys:
         ascending_flags = []
         for k in sort_keys:
-            if k == 'ATR%' or k == '流通市值(亿)':
+            if k in ('ATR%','流通市值(亿)'):
                 ascending_flags.append(True)
             else:
                 ascending_flags.append(False)
-        # 填补主力净流入NaN为极小值便于排序
         if '主力净流入(万)' in result_df.columns:
-            # 修复此前乱码 key
             if '主力净��入(万)' in result_df.columns:
                 result_df.rename(columns={'主力净��入(万)':'主力净流入(万)'}, inplace=True)
             result_df['主力净流入(万)'] = result_df['主力净流入(万)'].fillna(-1e12)
         result_df.sort_values(by=sort_keys, ascending=ascending_flags, inplace=True)
     pd.options.display.float_format = '{:.2f}'.format
-    print("\n\n========================= 最终备选列表 (排序: RS↓ 主力净流入↓ ATR%↑ 涨幅↓ 换手↓ 流通市值↑) =========================")
+    print("\n\n========================= 精选列表（不筛除，含指标匹配与匹配率） =========================")
     print(result_df)
     print("================================================================================================\n")
     filename = f"stock_selection_sh_main_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
