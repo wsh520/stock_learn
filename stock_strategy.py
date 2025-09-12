@@ -109,9 +109,10 @@ def get_fundamental_indicator(symbol: str):
     row = df.iloc[-1]
     def pick_val(cands):
         for c in cands:
-            if c in df.columns and not pd.isna(row[c]):
-                # 使用百分比解析，剔除“%”等
-                return parse_percent(row[c])
+            if c in df.columns:
+                val = row.get(c, np.nan)
+                if not pd.isna(val):
+                    return parse_percent(val)
         return np.nan
     roe = pick_val(['净资产收益率加权(%)','净资产收益率(%)','ROE加权(%)','ROE(%)','净资产收益率-加权(%)'])
     net_margin = pick_val(['销售净利率(%)','净利率(%)','销售净利率','净利率'])
@@ -901,7 +902,7 @@ def run_stock_screener():
                 except Exception:
                     vol_contraction = np.nan
             # 基本面
-            fund = get_fundamental_indicator(stock_code)
+            fund = get_fundamental_indicator(str(stock_code))
             roe_need = CONFIG['fundamental']['min_roe']
             nm_need = CONFIG['fundamental']['min_net_margin']
             roe_v = fund.get('roe', np.nan)
@@ -973,20 +974,9 @@ def run_stock_screener():
     for col in ['基本面合格', '基本面合格✓占比(%)']:
         if col in result_df.columns:
             result_df.drop(columns=[col], inplace=True)
-    # 新增：统计“涨幅区间”到“放量突破”之间各指标中✓的占比（逐行，✓/(✓+✗)*100）
-    cols_all = list(result_df.columns)
-    if '涨幅区间' in cols_all and '放量突破' in cols_all:
-        start_idx = cols_all.index('涨幅区间')
-        end_idx = cols_all.index('放量突破')
-        if start_idx <= end_idx:
-            subset = result_df.iloc[:, start_idx:end_idx+1]
-            applicable = subset.applymap(lambda x: x in ('✓','✗'))
-            passed = subset.applymap(lambda x: x == '✓')
-            denom = applicable.sum(axis=1).replace(0, np.nan)
-            core_ratio = (passed.sum(axis=1) / denom * 100.0).round(2)
-            # 插入在“放量突破”之后
-            insert_pos = end_idx + 1
-            result_df.insert(insert_pos, '核心指标✓占比(%)', core_ratio)
+    # (按最新需求) 移除核心指标占比列，不再计算插入
+    if '核心指标✓占比(%)' in result_df.columns:
+        result_df.drop(columns=['核心指标✓占比(%)'], inplace=True)
     # 排序：核心优先 相对强度↓ 主力净流入↓ ATR%↑; 次级再参考 涨跌幅↓ 换手率↓ 流通市值↑
     core_keys = []
     if rel_col_name in result_df.columns: core_keys.append(rel_col_name)
