@@ -699,7 +699,7 @@ def run_stock_screener():
     col_high = pick_col(stock_spot_df, ['最高','当日最高','最高价'], '最高')
     col_low = pick_col(stock_spot_df, ['最低','当日最低','最低价'], '最低')
     # 新增主力资金列
-    col_fund_flow = pick_col(stock_spot_df, CONFIG['enhanced_metrics']['fund_flow_candidates'], '主力净流入')
+    col_fund_flow = None  # 已按需求移除主力净流入相关逻辑
     if not all([col_change,col_volume_ratio,col_turnover,col_mv,col_amount,col_volume,col_price]):
         print("行情列名缺失，无法继续。")
         return
@@ -740,8 +740,6 @@ def run_stock_screener():
     numeric_cols = [col_change,col_volume_ratio,col_turnover,col_mv,col_amount,col_volume,col_price]
     if col_high: numeric_cols.append(col_high)
     if col_low: numeric_cols.append(col_low)
-    if col_fund_flow:
-        numeric_cols.append(col_fund_flow)
     for c in numeric_cols:
         stock_spot_df[c] = pd.to_numeric(stock_spot_df[c], errors='coerce')
     # ��内强度 (靠近高位) = (价-低)/(高-低)
@@ -784,8 +782,6 @@ def run_stock_screener():
         snapshot_df.rename(columns={col_change:'涨跌幅(%)'}, inplace=True)
     else:
         snapshot_df.rename(columns={col_change:'涨跌幅(%)'}, inplace=True)
-    if col_fund_flow and col_fund_flow != '主力净流入-净额':
-        snapshot_df.rename(columns={col_fund_flow:'主力净流入-净额'}, inplace=True)
     snapshot_df.insert(0, '截取时间', snapshot_time.strftime('%Y-%m-%d %H:%M:%S'))
     try:
         snapshot_df.to_csv(snapshot_filename, index=False, encoding='utf-8-sig')
@@ -815,7 +811,6 @@ def run_stock_screener():
         ma_bull_ok = None
         stair_ok = None
         breakout_ok = None
-        main_flow_wan = np.nan
         limit_up_col = f"近{em_conf['limit_up_lookback']}日涨停数"; limit_up_count = np.nan
         vol_contraction = np.nan
         roe_v = np.nan; nm_v = np.nan; fundamental_ok = None
@@ -920,12 +915,6 @@ def run_stock_screener():
                 fundamental_ok = None
         except Exception as e:
             print(f"  - [提示] 计算指标时出错: {e}")
-        # 主力净流入标准化为万
-        try:
-            if col_fund_flow and col_fund_flow in row.index:
-                main_flow_wan = normalize_money_to_wan(row[col_fund_flow])
-        except Exception:
-            pass
         # 预筛指标标记（用于展示）
         prelim_flags = {
             '涨幅区间': (row[col_change] >= adj_filter['change_rate_min']) and (row[col_change] <= adj_filter['change_rate_max']),
@@ -966,7 +955,6 @@ def run_stock_screener():
             rel_col_name: rs_value,
             'ATR%': atr_pct,
             '流通市值(亿)': row[col_mv] / 10 ** 8,
-            '主力净流入(万)': main_flow_wan,
             limit_up_col: limit_up_count,
             '波动收缩度': vol_contraction,
             'ROE(%)': roe_v,
@@ -1002,7 +990,6 @@ def run_stock_screener():
     # 排序：核心优先 相对强度↓ 主力净流入↓ ATR%↑; 次级再参考 涨跌幅↓ 换手率↓ 流通市值↑
     core_keys = []
     if rel_col_name in result_df.columns: core_keys.append(rel_col_name)
-    if '主力净流入(万)' in result_df.columns: core_keys.append('主力净流入(万)')
     if 'ATR%' in result_df.columns: core_keys.append('ATR%')
     secondary = [k for k in ['匹配率(%)','涨跌幅(%)','换手率(%)','流通市值(亿)','ROE(%)','净利率(%)'] if k in result_df.columns]
     sort_keys = core_keys + secondary
@@ -1013,10 +1000,6 @@ def run_stock_screener():
                 ascending_flags.append(True)
             else:
                 ascending_flags.append(False)
-        if '主力净流入(万)' in result_df.columns:
-            if '主力净��入(万)' in result_df.columns:
-                result_df.rename(columns={'主力净��入(万)':'主力净流入(万)'}, inplace=True)
-            result_df['主力净流入(万)'] = result_df['主力净流入(万)'].fillna(-1e12)
         result_df.sort_values(by=sort_keys, ascending=ascending_flags, inplace=True)
     # 统一对百分比列四舍五入保留两位小数（列名包含“%”）
     percent_cols = [c for c in result_df.columns if '%' in str(c)]
