@@ -92,12 +92,34 @@ def pick_col(df: pd.DataFrame, candidates, alias=None):
         print(f"缺少列: {alias} (候选: {candidates})")
     return None
 
+def get_cache_dir():
+    cache_dir = os.path.join(os.path.dirname(__file__), 'cache')
+    os.makedirs(cache_dir, exist_ok=True)
+    return cache_dir
+
 # ================== 新增函数: 财务指标与风险控制动态调参 ==================
 @lru_cache(maxsize=512)
 def get_fundamental_indicator(symbol: str):
     cfg = CONFIG.get('fundamental', {})
     if not cfg.get('enabled', False):
         return {"roe": np.nan, "net_margin": np.nan}
+    # 文件缓存（按天）
+    cache_days = cfg.get('cache_days', 3)
+    cache_dir = get_cache_dir()
+    cache_file = os.path.join(cache_dir, 'fundamentals.json')
+    cache_data = {}
+    today = datetime.now().strftime('%Y-%m-%d')
+    if os.path.exists(cache_file):
+        try:
+            with open(cache_file, 'r', encoding='utf-8') as f:
+                cache_data = json.load(f)
+        except Exception:
+            cache_data = {}
+    sym_cache = cache_data.get(symbol)
+    if sym_cache:
+        ts = sym_cache.get('date')
+        if ts and (datetime.strptime(today, '%Y-%m-%d') - datetime.strptime(ts, '%Y-%m-%d')).days < cache_days:
+            return {"roe": sym_cache.get('roe', np.nan), "net_margin": sym_cache.get('net_margin', np.nan)}
     try:
         df = ak.stock_financial_analysis_indicator(symbol=symbol)
     except Exception:
@@ -116,6 +138,12 @@ def get_fundamental_indicator(symbol: str):
         return np.nan
     roe = pick_val(['净资产收益率加权(%)','净资产收益率(%)','ROE加权(%)','ROE(%)','净资产收益率-加权(%)'])
     net_margin = pick_val(['销售净利率(%)','净利率(%)','销售净利率','净利率'])
+    cache_data[symbol] = {"date": today, "roe": roe, "net_margin": net_margin}
+    try:
+        with open(cache_file, 'w', encoding='utf-8') as f:
+            json.dump(cache_data, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
     return {"roe": roe, "net_margin": net_margin}
 
 def apply_risk_control_dynamic(adj_filter: dict, index_hist: pd.DataFrame):
@@ -840,15 +868,8 @@ def run_stock_screener():
                     if not hard_atr_ok and atr_pct <= atr_soft:
                         print(f"  * [宽松提醒] ATR边缘 {atr_pct:.2f}% > {CONFIG['technique']['max_atr_pct']}%")
                 # 相对强度
-                if len(hist_df['收盘']) >= rs_days:
-                    if index_hist_main is None or index_hist_main.empty or len(index_hist_main) < rs_days:
-                        bench_return = 0.0
-                    else:
-                        bench_return = float((index_hist_main['收盘'].iloc[-1] / index_hist_main['收盘'].iloc[-rs_days]) - 1)
-                    stock_return = float((close_val / hist_df['收盘'].iloc[-rs_days]) - 1) if close_val and not np.isnan(close_val) else np.nan
-                    if not np.isnan(stock_return):
-                        rs_ok = stock_return >= bench_return
-                        rs_value = (stock_return - bench_return) * 100.0
+                if len(hist_df['收盘']) >= rs_days and index_hist_main is not None and not index_hist_main.empty:
+                    rs_value, rs_ok = compute_relative_strength(hist_df, index_hist_main, rs_days)
                 # VWAP
                 if vol is not None and not np.isnan(vol) and vol > 0 and amount is not None and not np.isnan(amount):
                     vwap_guess = amount / vol if vol != 0 else np.nan
@@ -944,6 +965,13 @@ def run_stock_screener():
         passed_cnt = int(sum(1 for v in applicable_vals if v))
         total_cnt = int(len(applicable_vals))
         match_rate = round((passed_cnt / total_cnt * 100.0), 2) if total_cnt > 0 else np.nan
+        # 新增：区间指标占比(从 涨幅区间 到 放量突破)
+        range_keys = ['涨幅区间','量比≥下限','换手率区间','流通市值区间','非ST/非N','日内强度≥阈值','强势行业','ATR≤硬阈值','RS优于指数','价≥VWAP(98%)','均线多头','台阶放量','放量突破']
+        range_bools = [all_flags[k] for k in range_keys if k in all_flags and isinstance(all_flags[k], bool)]
+        if range_bools:
+            range_rate = round(sum(1 for v in range_bools if v) / len(range_bools) * 100, 2)
+        else:
+            range_rate = np.nan
         pretty_flags = {k: ('✓' if v else '✗') if isinstance(v, bool) else '-' for k, v in all_flags.items()}
         # 记录
         record = {
@@ -958,10 +986,8 @@ def run_stock_screener():
             '流通市值(亿)': row[col_mv] / 10 ** 8,
             limit_up_col: limit_up_count,
             '波动收缩度': vol_contraction,
-            'ROE(%)': roe_v,
-            '净利率(%)': nm_v,
-            '所属行业': stock_to_sector_map.get(stock_code, '未知'),
-            '匹配率(%)': match_rate,
+            # '所属行业': stock_to_sector_map.get(stock_code, '未知'),
+            '区间指标占比(%)': range_rate,
         }
         record.update(pretty_flags)
         final_selection.append(record)
@@ -971,26 +997,16 @@ def run_stock_screener():
         return
     result_df = pd.DataFrame(final_selection)
     # 删除“基本面合格”与旧的整体占比列（若存在）
-    for col in ['基本面合格', '基本面合格✓占比(%)']:
+    for col in ['基本面合格', '基本面合格✓占比(%)','所属行业']:
+        if col in result_df.columns:
+            result_df.drop(columns=[col], inplace=True)
+    # 移除匹配率、ROE、净利率列（按最新需求）
+    for col in ['匹配率(%)','ROE(%)','净利率(%)']:
         if col in result_df.columns:
             result_df.drop(columns=[col], inplace=True)
     # (按最新需求) 移除核心指标占比列，不再计算插入
     if '核心指标✓占比(%)' in result_df.columns:
         result_df.drop(columns=['核心指标✓占比(%)'], inplace=True)
-    # 排序：核心优先 相对强度↓ 主力净流入↓ ATR%↑; 次级再参考 涨跌幅↓ 换手率↓ 流通市值↑
-    core_keys = []
-    if rel_col_name in result_df.columns: core_keys.append(rel_col_name)
-    if 'ATR%' in result_df.columns: core_keys.append('ATR%')
-    secondary = [k for k in ['匹配率(%)','涨跌幅(%)','换手率(%)','流通市值(亿)','ROE(%)','净利率(%)'] if k in result_df.columns]
-    sort_keys = core_keys + secondary
-    if sort_keys:
-        ascending_flags = []
-        for k in sort_keys:
-            if k in ('ATR%','流通市值(亿)'):
-                ascending_flags.append(True)
-            else:
-                ascending_flags.append(False)
-        result_df.sort_values(by=sort_keys, ascending=ascending_flags, inplace=True)
     # 统一对百分比列四舍五入保留两位小数（列名包含“%”）
     percent_cols = [c for c in result_df.columns if '%' in str(c)]
     if percent_cols:
@@ -1004,6 +1020,67 @@ def run_stock_screener():
     filename = f"stock_selection_sh_main_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
     result_df.to_csv(filename, index=False, encoding='utf-8-sig')
     print(f"选股结果已保存到文件: {filename}")
+
+
+def compute_relative_strength(stock_hist: pd.DataFrame, index_hist: pd.DataFrame, days: int):
+    """计算相对强度(超额收益, %) 并给出是否跑赢指数标记。
+    定义: RS = (个股区间收益 - 指数区间收益) * 100
+    个股区间收益 = (末收盘 / 起始收盘) - 1 （基于交易日序列，不跨停牌日补齐）
+    逻辑:
+      1. 参数与数据有效性检查（days>=1, 数据非空）
+      2. 统一日期列：优先使用 '日期' 或 'date'，转为 datetime.date
+      3. 内连接对齐交易日（避免停牌 / 节假日错位）
+      4. 需要 >= days+1 条对齐数据（才能向前回溯 days 个交易日）
+      5. 取 merged.iloc[-1] 作为区间末，merged.iloc[-(days+1)] 作为区间初
+      6. 若任一关键值缺失 -> 返回 (np.nan, None)
+      7. rs_ok = 个股区间收益 >= 指数区间收益
+    返回: (rs_value: float|nan, rs_ok: bool|None)
+    """
+    try:
+        if days is None or days <= 0:
+            return np.nan, None
+        if stock_hist is None or stock_hist.empty or index_hist is None or index_hist.empty:
+            return np.nan, None
+        # 提取所需列并复制
+        def prep(df):
+            df_use = df.copy()
+            # 可能列名
+            if '日期' in df_use.columns:
+                df_use['_dt'] = pd.to_datetime(df_use['日期']).dt.date
+            elif 'date' in df_use.columns:
+                df_use['_dt'] = pd.to_datetime(df_use['date']).dt.date
+            else:
+                # 无日期列（极端情况），用索引模拟，无法保证对齐准确
+                df_use['_dt'] = pd.RangeIndex(start=0, stop=len(df_use))
+            # 统一收盘列
+            close_col = '收盘' if '收盘' in df_use.columns else None
+            if close_col is None:
+                # akshare 某些指数备用接口可能列名是 'close'
+                if 'close' in df_use.columns:
+                    df_use['收盘'] = pd.to_numeric(df_use['close'], errors='coerce')
+                    close_col = '收盘'
+            df_use['收盘'] = pd.to_numeric(df_use['收盘'], errors='coerce') if '收盘' in df_use.columns else np.nan
+            return df_use[['收盘','_dt']].dropna()
+        s_pre = prep(stock_hist)
+        i_pre = prep(index_hist)
+        if s_pre.empty or i_pre.empty:
+            return np.nan, None
+        merged = pd.merge(s_pre, i_pre, on='_dt', how='inner', suffixes=('_stock','_index'))
+        if len(merged) < days + 1:
+            return np.nan, None
+        end_row = merged.iloc[-1]
+        start_row = merged.iloc[-(days+1)]
+        sc_end = safe_float(end_row['收盘_stock']); sc_start = safe_float(start_row['收盘_stock'])
+        ix_end = safe_float(end_row['收盘_index']); ix_start = safe_float(start_row['收盘_index'])
+        if any(pd.isna(v) or v == 0 for v in [sc_end, sc_start, ix_end, ix_start]):
+            return np.nan, None
+        stock_ret = sc_end / sc_start - 1.0
+        index_ret = ix_end / ix_start - 1.0
+        rs_val = (stock_ret - index_ret) * 100.0
+        rs_ok = stock_ret >= index_ret
+        return rs_val, rs_ok
+    except Exception:
+        return np.nan, None
 
 
 if __name__ == "__main__":
