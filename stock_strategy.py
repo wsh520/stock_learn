@@ -1014,12 +1014,19 @@ def run_stock_screener():
             result_df[c] = pd.to_numeric(result_df[c], errors='coerce')
         result_df[percent_cols] = result_df[percent_cols].round(2)
     pd.options.display.float_format = '{:.2f}'.format
-    print("\n\n========================= 精选列表（不筛除，含指标匹配与匹配率） =========================")
-    print(result_df)
-    print("================================================================================================\n")
+    # 新增：只导出“区间指标占比(%)”最高前五 (按倒序)
+    export_df = result_df
+    sort_col = '区间指标占比(%)'
+    if sort_col in result_df.columns:
+        export_df = result_df.sort_values(sort_col, ascending=False).head(5).copy()
+    else:
+        print(f"警告: 未找到列 {sort_col}，将导出全部。")
+    print("\n\n========================= 区间指标占比 Top5 =========================")
+    print(export_df)
+    print("====================================================================\n")
     filename = f"stock_selection_sh_main_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-    result_df.to_csv(filename, index=False, encoding='utf-8-sig')
-    print(f"选股结果已保存到文件: {filename}")
+    export_df.to_csv(filename, index=False, encoding='utf-8-sig')
+    print(f"选股结果已保存到文件(Top5 by {sort_col}): {filename}")
 
 
 def compute_relative_strength(stock_hist: pd.DataFrame, index_hist: pd.DataFrame, days: int):
