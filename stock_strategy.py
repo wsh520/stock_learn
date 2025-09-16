@@ -6,6 +6,7 @@ import time
 from functools import lru_cache
 import os
 import json
+import argparse
 
 # 新增: 列处理与列名适配工具函数
 # -------------------------------------------------
@@ -1090,7 +1091,272 @@ def compute_relative_strength(stock_hist: pd.DataFrame, index_hist: pd.DataFrame
         return np.nan, None
 
 
+def find_previous_top5_file(base_dir: str) -> str | None:
+    """查找上一交易日生成的 Top5 结果文件 (stock_selection_sh_main_YYYYMMDD_*.csv)"""
+    try:
+        files = [f for f in os.listdir(base_dir) if f.startswith('stock_selection_sh_main_') and f.endswith('.csv')]
+    except Exception:
+        return None
+    if not files:
+        return None
+    today = datetime.now().date()
+    candidates = []
+    for f in files:
+        try:
+            date_part = f.replace('stock_selection_sh_main_','').split('_')[0]
+            d = datetime.strptime(date_part, '%Y%m%d').date()
+            if d < today:
+                candidates.append((d, f))
+        except Exception:
+            continue
+    if not candidates:
+        return None
+    candidates.sort(key=lambda x: (x[0], x[1]), reverse=True)
+    return os.path.join(base_dir, candidates[0][1])
+
+
+def track_previous_top5(show_output: bool = True):
+    """读取上一交易日Top5文件，输出当前实时表现及统计。返回 (DataFrame, summary_dict) 或 None"""
+    base_dir = os.path.dirname(__file__)
+    prev_file = find_previous_top5_file(base_dir)
+    if not prev_file:
+        if show_output:
+            print("未找到上一交易日Top5文件，跳过跟踪。")
+        return None
+    try:
+        prev_df = pd.read_csv(prev_file)
+    except Exception as e:
+        print(f"读取上一交易日Top5文件失败: {e}")
+        return None
+    if '代码' not in prev_df.columns or '最新价' not in prev_df.columns:
+        print(f"文件缺少必要列(代码/最新价): {os.path.basename(prev_file)}")
+        return None
+    prev_df['最新价'] = pd.to_numeric(prev_df['最新价'], errors='coerce')
+    prev_df = prev_df.dropna(subset=['最新价'])
+    if prev_df.empty:
+        print("上一交易日Top5文件无有效基准价数据。")
+        return None
+    codes = prev_df['代码'].astype(str).tolist()
+    try:
+        spot_df = ak.stock_zh_a_spot_em()
+    except Exception as e:
+        print(f"获取实时行情失败: {e}")
+        return None
+    if spot_df is None or spot_df.empty:
+        print("实时行情为空，无法跟踪。")
+        return None
+    spot_df = drop_duplicate_columns(spot_df)
+    col_price_now = pick_col(spot_df, ['最新价','现价','收盘价'], '最新价')
+    col_change_now = pick_col(spot_df, ['涨跌幅','涨跌幅(%)','涨幅'], '涨跌幅')
+    if not col_price_now:
+        print("实时行情缺少价格列，无法跟踪。")
+        return None
+    now_sub = spot_df[spot_df['代码'].isin(codes)].copy()
+    if now_sub.empty:
+        print("上一交易日Top5代码今日行情均缺失。")
+        return None
+    now_sub[col_price_now] = pd.to_numeric(now_sub[col_price_now], errors='coerce')
+    if col_change_now:
+        now_sub[col_change_now] = pd.to_numeric(now_sub[col_change_now], errors='coerce')
+    base_price_map = prev_df.set_index('代码')['最新价'].to_dict()
+    rows = []
+    for _, r in now_sub.iterrows():
+        code = r['代码']
+        current_price = safe_float(r[col_price_now])
+        base_price = safe_float(base_price_map.get(code, np.nan))
+        change_pct = safe_float(r.get(col_change_now, np.nan)) if col_change_now else np.nan
+        rel_ret = np.nan
+        if base_price and not np.isnan(base_price) and base_price != 0 and current_price and not np.isnan(current_price):
+            rel_ret = (current_price / base_price - 1) * 100
+        rows.append({
+            '代码': code,
+            '名称': r.get('名称',''),
+            '昨日基准价': base_price,
+            '当前价': current_price,
+            '当日涨跌幅(%)': change_pct,
+            '相对基准收益(%)': rel_ret
+        })
+    track_df = pd.DataFrame(rows)
+    for c in ['当日涨跌幅(%)','相对基准收益(%)']:
+        if c in track_df.columns:
+            track_df[c] = pd.to_numeric(track_df[c], errors='coerce').round(2)
+    valid = track_df['相对基准收益(%)'].dropna()
+    if len(valid):
+        summary = {
+            '胜率(>0%)': round(valid.gt(0).mean()*100,2),
+            '平均收益(%)': round(valid.mean(),2),
+            '中位数收益(%)': round(valid.median(),2),
+            '大于2%占比(%)': round(valid.gt(2).mean()*100,2),
+            '大于5%占比(%)': round(valid.gt(5).mean()*100,2),
+        }
+    else:
+        summary = {k: np.nan for k in ['胜率(>0%)','平均收益(%)','中位数收益(%)','大于2%占比(%)','大于5%占比(%)']}
+    if show_output:
+        print("\n================ 上一交易日 Top5 跟踪 =================")
+        print(f"来源文件: {os.path.basename(prev_file)}")
+        print(track_df)
+        print("----------------------------------------------------")
+        print("统计:")
+        for k,v in summary.items():
+            print(f"  {k}: {v}")
+        print("====================================================\n")
+    out_name = f"track_prev_top5_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+    try:
+        track_df.to_csv(out_name, index=False, encoding='utf-8-sig')
+    except Exception:
+        pass
+    return track_df, summary
+
+
+def _parse_top5_date(fname: str):
+    try:
+        core = fname.replace('stock_selection_sh_main_','')
+        d = core.split('_')[0]
+        return datetime.strptime(d, '%Y%m%d').date()
+    except Exception:
+        return None
+
+
+def list_top5_files(base_dir: str):
+    files = [f for f in os.listdir(base_dir) if f.startswith('stock_selection_sh_main_') and f.endswith('.csv')]
+    items = []
+    for f in files:
+        d = _parse_top5_date(f)
+        if d:
+            items.append((d, f, os.path.join(base_dir, f)))
+    items.sort(key=lambda x: x[0])
+    return items
+
+
+def compute_future_return(stock_code: str, base_price: float, base_date: datetime.date, horizon: int):
+    if base_price is None or np.isnan(base_price) or base_price == 0:
+        return np.nan, np.nan
+    start = base_date.strftime('%Y%m%d')
+    end = (base_date + timedelta(days=horizon+10)).strftime('%Y%m%d')
+    try:
+        hist = ak.stock_zh_a_hist(symbol=stock_code, period='daily', start_date=start, end_date=end, adjust='qfq')
+    except Exception:
+        return np.nan, np.nan
+    if hist is None or hist.empty or '日期' not in hist.columns or '收盘' not in hist.columns:
+        return np.nan, np.nan
+    hist['日期'] = pd.to_datetime(hist['日期']).dt.date
+    fut = hist[hist['日期'] > base_date]
+    if fut.empty:
+        return np.nan, np.nan
+    if len(fut) >= horizon:
+        target = fut.iloc[horizon-1]
+    else:
+        target = fut.iloc[-1]
+    close_p = safe_float(target['收盘'])
+    if not close_p or np.isnan(close_p):
+        return np.nan, np.nan
+    ret = (close_p / base_price - 1) * 100
+    return ret, target['日期']
+
+
+def backtest_top5_performance(horizons=(1,2,5), show_output=True):
+    base_dir = os.path.dirname(__file__)
+    items = list_top5_files(base_dir)
+    if not items:
+        print("无历史Top5文件可回测。")
+        return
+    index_code = CONFIG['market_timing']['index_code']
+    perf_rows = []
+    summary_rows = []
+    for d, fname, full in items:
+        try:
+            df = pd.read_csv(full)
+        except Exception as e:
+            print(f"读取失败 {fname}: {e}")
+            continue
+        if '代码' not in df.columns or '最新价' not in df.columns:
+            continue
+        df['最新价'] = pd.to_numeric(df['最新价'], errors='coerce')
+        df = df.dropna(subset=['最新价'])
+        if df.empty:
+            continue
+        try:
+            idx_hist = ak.stock_zh_index_daily(symbol=index_code.replace('sh','').replace('sz',''))
+        except Exception:
+            idx_hist = None
+        idx_sub = None
+        if isinstance(idx_hist, pd.DataFrame) and not idx_hist.empty and 'date' in idx_hist.columns and 'close' in idx_hist.columns:
+            idx_hist['date'] = pd.to_datetime(idx_hist['date']).dt.date
+            idx_sub = idx_hist[(idx_hist['date'] >= (d - timedelta(days=5))) & (idx_hist['date'] <= (d + timedelta(days=max(horizons)+10)))]
+        for _, r in df.iterrows():
+            code = str(r['代码']); base_price = safe_float(r['最新价']); name = r.get('名称','')
+            for h in horizons:
+                ret, tgt_date = compute_future_return(code, base_price, d, h)
+                idx_ret = np.nan
+                if idx_sub is not None and not idx_sub.empty:
+                    after_idx = idx_sub[idx_sub['date'] > d]
+                    if not after_idx.empty:
+                        if len(after_idx) >= h:
+                            idx_target = after_idx.iloc[h-1]
+                        else:
+                            idx_target = after_idx.iloc[-1]
+                        base_idx_series = idx_sub[idx_sub['date'] <= d]
+                        if not base_idx_series.empty:
+                            base_close = safe_float(base_idx_series.iloc[-1]['close'])
+                            tgt_close = safe_float(idx_target['close'])
+                            if base_close and tgt_close:
+                                idx_ret = (tgt_close / base_close - 1) * 100
+                alpha = ret - idx_ret if (not np.isnan(ret) and not np.isnan(idx_ret)) else np.nan
+                perf_rows.append({
+                    '基准日期': d,
+                    '文件': fname,
+                    '代码': code,
+                    '名称': name,
+                    '基线价': base_price,
+                    'H': h,
+                    'H日收益(%)': ret,
+                    'H日指数收益(%)': idx_ret,
+                    'H日超额收益(%)': alpha,
+                    'H目标日期': tgt_date
+                })
+        for h in horizons:
+            subset = [row for row in perf_rows if row['基准日期']==d and row['H']==h]
+            if not subset:
+                continue
+            rets = [row['H日收益(%)'] for row in subset if not np.isnan(row['H日收益(%)'])]
+            alphas = [row['H日超额收益(%)'] for row in subset if not np.isnan(row['H日超额收益(%)'])]
+            if rets:
+                summary_rows.append({
+                    '基准日期': d,
+                    'H': h,
+                    '样本数': len(rets),
+                    '平均收益(%)': round(np.mean(rets),2),
+                    '中位数收益(%)': round(np.median(rets),2),
+                    '胜率(>0%)': round(sum(r>0 for r in rets)/len(rets)*100,2),
+                    '>2%占比': round(sum(r>2 for r in rets)/len(rets)*100,2),
+                    '>5%占比': round(sum(r>5 for r in rets)/len(rets)*100,2),
+                    '平均超额(%)': round(np.mean(alphas),2) if alphas else np.nan
+                })
+    if not perf_rows:
+        print("未生成任何绩效记录。")
+        return
+    perf_df = pd.DataFrame(perf_rows)
+    summary_df = pd.DataFrame(summary_rows)
+    for c in ['H日收益(%)','H日指数收益(%)','H日超额收益(%)']:
+        if c in perf_df.columns:
+            perf_df[c] = pd.to_numeric(perf_df[c], errors='coerce').round(2)
+    perf_df.to_csv('performance_log.csv', index=False, encoding='utf-8-sig')
+    summary_df.to_csv('performance_summary.csv', index=False, encoding='utf-8-sig')
+    if show_output:
+        print("\n===== 历史Top5多日绩效汇总 =====")
+        print(summary_df.tail(30))
+        print("================================\n")
+    return perf_df, summary_df
+
+
 if __name__ == "__main__":
-    if check_trading_time():
-        if check_market_regime():
-            run_stock_screener()
+    parser = argparse.ArgumentParser(description='选股脚本运行模式')
+    parser.add_argument('--mode', choices=['run','backtest_top5'], default='run')
+    args = parser.parse_args()
+    if args.mode == 'backtest_top5':
+        backtest_top5_performance()
+    else:
+        if check_trading_time():
+            track_previous_top5()
+            if check_market_regime():
+                run_stock_screener()
