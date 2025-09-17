@@ -1092,7 +1092,15 @@ def compute_relative_strength(stock_hist: pd.DataFrame, index_hist: pd.DataFrame
 
 
 def find_previous_top5_file(base_dir: str) -> str | None:
-    """查找上一交易日生成的 Top5 结果文件 (stock_selection_sh_main_YYYYMMDD_*.csv)"""
+    """获取上一交易日(相对于今天)最新时间戳的 stock_selection_sh_main_YYYYMMDD_*.csv 文件。
+    逻辑:
+      1. 搜集所有 stock_selection_sh_main_*.csv
+      2. 解析日期(YYYYMMDD)与时间(HHMMSS)
+      3. 过滤日期 < 今天 的文件
+      4. 以日期降序遍历, 对每个日期选取时间(若有)最大的一份作为候选
+      5. 返回第一天(最近的上一交易日)的最新文件路径
+    若无匹配返回 None
+    """
     try:
         files = [f for f in os.listdir(base_dir) if f.startswith('stock_selection_sh_main_') and f.endswith('.csv')]
     except Exception:
@@ -1100,19 +1108,40 @@ def find_previous_top5_file(base_dir: str) -> str | None:
     if not files:
         return None
     today = datetime.now().date()
-    candidates = []
+    date_map = {}
     for f in files:
         try:
-            date_part = f.replace('stock_selection_sh_main_','').split('_')[0]
-            d = datetime.strptime(date_part, '%Y%m%d').date()
-            if d < today:
-                candidates.append((d, f))
+            core = f.replace('stock_selection_sh_main_','')  # YYYYMMDD_HHMMSS.csv 或 YYYYMMDD_...
+            parts = core.split('_')
+            date_part = parts[0]
+            dt = datetime.strptime(date_part, '%Y%m%d').date()
+            if dt >= today:
+                continue
+            time_part = None
+            if len(parts) > 1:
+                tp = parts[1]
+                # 去掉扩展名中的.csv
+                tp = tp.replace('.csv','')
+                # 仅取前6位数字方便比较
+                tp_digits = ''.join(ch for ch in tp if ch.isdigit())
+                if len(tp_digits) >= 6:
+                    time_part = tp_digits[:6]
+            # 没有时间部分给一个最小占位, 保证有时间的优先
+            if time_part is None:
+                time_part = '000000'
+            date_map.setdefault(dt, []).append((time_part, f))
         except Exception:
             continue
-    if not candidates:
+    if not date_map:
         return None
-    candidates.sort(key=lambda x: (x[0], x[1]), reverse=True)
-    return os.path.join(base_dir, candidates[0][1])
+    # 按日期倒序
+    for d in sorted(date_map.keys(), reverse=True):
+        # 在该日期内选最大时间戳
+        entries = date_map[d]
+        entries.sort(key=lambda x: x[0], reverse=True)
+        # 返回第一条
+        return os.path.join(base_dir, entries[0][1])
+    return None
 
 
 def track_previous_top5(show_output: bool = True):
